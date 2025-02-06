@@ -1,0 +1,160 @@
+---
+title: "Differential Expression Analysis"
+author: "Desmond Cairo"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r working directory}
+setwd("~") #Set working directory
+```
+
+## Alignment To Genome
+
+Utilize hisat2 bash script to build indexes and align to reference genome
+
+```{r hisat2}
+library(systemPipeR)
+# Define args for later usage
+args <- systemArgs(sysma="~/bigdata_nagellab/ClockGeneAnalysis/systemPipeRFiles/hisat2.param", 
+                   mytargets="~/bigdata_nagellab/ClockGeneAnalysis/systemPipeRFiles/targetsFull.txt")
+
+# Use the system terminal which needs hisat2 installed 
+system("hisat2-build ./tair10.fasta ./tair10.fasta")
+system("./FastQToSortedBam.bash")
+```
+
+Use summarizeOverlaps to generate counts for files specified in targets.txt
+
+```{r summarizeOverlaps}
+library("GenomicFeatures"); library(BiocParallel); library(parallel)
+txdb <- makeTxDbFromGFF(file="~/bigdata_nagellab/ClockGeneAnalysis/indexFiles/Araport11_GFF3_genes_transposons.201606.gff", format="gff", dataSource="TAIR", organism="Arabidopsis thaliana")
+saveDb(txdb, file="~/bigdata_nagellab/ClockGeneAnalysis/indexFiles/tair10.sqlite")
+txdb <- loadDb("~/bigdata_nagellab/ClockGeneAnalysis/indexFiles/tair10.sqlite")
+future::availableCores()
+(align <- readGAlignments(outpaths(args)[1])) # Demonstrates how to read bam file into R
+eByg <- exonsBy(txdb, by=c("gene"))
+bfl <- BamFileList(outpaths(args), yieldSize=50000, index=character())
+multicoreParam <- MulticoreParam(workers=12); register(multicoreParam); registered()
+counteByg <- bplapply(bfl, function(x) summarizeOverlaps(eByg, x, mode="Union", ignore.strand=TRUE, inter.feature=FALSE, singleEnd=TRUE)) 
+countDFeByg <- sapply(seq(along=counteByg), function(x) assays(counteByg[[x]])$counts)
+rownames(countDFeByg) <- names(rowRanges(counteByg[[1]])); colnames(countDFeByg) <- names(bfl)
+rpkmDFeByg <- apply(countDFeByg, 2, function(x) returnRPKM(counts=x, ranges=eByg))
+write.table(countDFeByg, "~/bigdata_nagellab/ClockGeneAnalysis/dataOut/countDFeBygFull.xls", col.names=NA, quote=FALSE, sep="\t")
+write.table(rpkmDFeByg, "~/bigdata_nagellab/ClockGeneAnalysis/dataOut/rpkmDFeBygFull.xls", col.names=NA, quote=FALSE, sep="\t")
+```
+
+## Differential Expression Analysis
+
+```{r Filtering Counts, include=FALSE}
+
+countDF <- as.matrix(read.table("~/bigdata_nagellab/ClockGeneAnalysis/dataOut/countDFeBygFull.xls"))
+
+experimentNames <- sapply(strsplit(as.character(targetsin(args)$SampleName), "_"), function(x) toupper(x[1]))
+colData <- data.frame(row.names=targetsin(args)$SampleName, condition=targetsin(args)$Factor, experiment=experimentNames)
+```
+
+Utilize systempipeR to run DESeq2. Set independent to true due to the data not necessarily able to be compared across samples due to drastic differences in procedures between papers the data was derived from
+
+```{r tranforming data, include=FALSE}
+library(tidyverse); library(data.table)
+
+targets <- read.delim("~/bigdata_nagellab/ClockGeneAnalysis/systemPipeRFiles/targetsFull.txt", comment="#")
+cmp <- readComp(file="~/bigdata_nagellab/ClockGeneAnalysis/systemPipeRFiles/targetsFull.txt", format="matrix", delim="-")
+degseqDF <- run_DESeq2(countDF=countDF, targets=targets, cmp=cmp[[1]], independent=TRUE)
+
+write.table(degseqDF, "~/bigdata_nagellab/ClockGeneAnalysis/dataOut/DESeq2Comps.xls", col.names=NA, quote=FALSE, sep="\t")
+
+```
+
+Subset data frame obtained from run_DESeq2 to only include the genes of interest
+
+```{r filter DEGs}
+genesOfInterest <- c(LHY = "AT1G01060", PRR9 = "AT2G46790", CCA1 = "AT2G46830", RVE8 = "AT3G09600", PRR7 = "AT5G02810", RVE4 = "AT5G02840", TOC1 = "AT5G61380")
+#names(genesOfInterest) <- c("LHY", "PRR9", "CCA1", "RVE8", "PRR7", "RVE4", "TOC1")
+degseqDF_filtered <- degseqDF[genesOfInterest, ]
+```
+
+## Visualization
+
+Utilization of ComplexHeatmap for heatmap generation of expression data
+
+```{r heatmap generation}
+library(pheatmap)
+library(tibble)
+library(dplyr)
+
+# Subset degSeqDF for logFold changes from all conditions
+logFC_subset <- degseqDF_filtered[,grep("log", colnames(degseqDF))]
+padj_subset <- degseqDF_filtered[,grep("FDR", colnames(degseqDF))]
+logFC_subset <- logFC_subset %>%
+  relocate(`pif4_T-PIF4_C_logFC`, .after = `PIF5.BL_T-PIF5.BL_C_logFC`)
+padj_subset <- padj_subset %>%
+  relocate(`pif4_T-PIF4_C_FDR`, .after = `PIF5.BL_T-PIF5.BL_C_FDR`)
+
+# Creation of expression vector to allow for italic font style
+explicitNames <- c(expression(italic("35S:TZF1")), expression(italic("bbx28-5(A)")), expression(italic("bbx28-5(B)")), expression( italic("35S:PIF5(A)")), expression(italic("35S:PIF5(B)")),  expression(italic("pif4-101")), expression( italic("35S:PIF4(A)")), expression(italic("35S:PIF4(B)")), expression( italic("p35S:GR:CDF1")), expression(italic("p35S:GR:HB6")), expression(italic("p35S:GR:HYH")), expression(italic("p35S:GR:RAV1")))
+
+
+# Creation of two subsets for use of assigning significance stars
+logFC_subsetRenamed <- logFC_subset %>% 
+  setNames(explicitNames) %>%
+  `rownames<-` (., names(genesOfInterest)[row.names(.) == genesOfInterest])
+  
+padJ_subsetRenamed <- padj_subset %>% 
+  setNames(explicitNames) %>%
+  `rownames<-` (., names(genesOfInterest)[row.names(.) == genesOfInterest]) #%>%
+
+# Takes a dataframe of FDR and seperate logFC values that must match dimensions (there is no check for this) as well as the logFC threshold found to be suitable for approach. Dataframe cells that are significant but failt to meet logFC threshold are assigned open stars, wheras cells that meet both criteria are assigned closed stars. 
+assignSigStars <- function(padjDF, logfcDF, logFC_threshold) {
+  outputDF <- padjDF
+  
+  for(i in 1:nrow(outputDF)) {
+    for(j in 1:ncol(outputDF)) {
+      if(abs(logfcDF[i, j]) > logFC_threshold) {
+        if(padjDF[i, j] < 0.001) {
+          outputDF[i, j] <- "\u2731\u2731\u2731"
+        } else if(padjDF[i, j] < 0.01){
+          outputDF[i, j] <- "\u2731\u2731"
+        } else if(padjDF[i, j] < 0.05){
+          outputDF[i, j] <- "\u2731"
+        } else {
+          outputDF[i, j] <- ""
+        }
+      } else {
+        if(padjDF[i, j] < 0.001) {
+          outputDF[i, j] <- "\u2732\u2732\u2732"
+        } else if(padjDF[i, j] < 0.01){
+          outputDF[i, j] <- "\u2732\u2732"
+        } else if(padjDF[i, j] < 0.05){
+          outputDF[i, j] <- "\u2732"
+        } else {
+          outputDF[i, j] <- ""
+        }
+      }
+    }
+  }
+  
+  return(outputDF)
+}
+
+# \u2731 heavy asterisk
+# \u2732 open asterisk
+
+# Assign signiciance stars based on logFC of 150%
+significanceDF <- assignSigStars(padJ_subsetRenamed, logFC_subsetRenamed, log2(2))
+
+#Specify color palette 
+colors <- colorRampPalette(c("purple2", "white", "orange1"))(100)
+
+#Italicizes gene names
+italicRows <- lapply(rownames(logFC_subsetRenamed), function(x) bquote(italic(.(x))))
+
+ComplexHeatmap::pheatmap(as.matrix(logFC_subsetRenamed), cluster_cols = FALSE, color = colors, angle_col = c("315"), labels_row = as.expression(italicRows), labels_col = as.expression(explicitNames), display_numbers = as.matrix(significanceDF), fontsize_number = 8, number_color = "#1C1C1C", heatmap_legend_param = list(title = "logFC", at = c(-2, -1, 0, 1, 2)))
+```
